@@ -113,7 +113,7 @@ CI runs the same suite on every push. Network and Slack are mocked; the heuristi
 
 ## Legal / ToS note
 
-The scraper only requests the URL the caller supplies. Use it on public marketing sites you are allowed to fetch. Do not point this at authenticated apps, job boards with anti-bot terms, or purchased email lists.
+The scraper only requests the URL the caller supplies. Every fetch (including `robots.txt` and each redirect hop) is checked by an SSRF guard (`src/services/url_guard.py`): the host is resolved and loopback, private, link-local (e.g. `169.254.169.254`), CGNAT, multicast, and reserved IPv4/IPv6 addresses are refused. `robots.txt` is evaluated per RFC 9309 (longest match wins, `Allow` honored). Responses are streamed and capped at `SCRAPE_MAX_BYTES`. Use it on public marketing sites you are allowed to fetch. Do not point this at authenticated apps, job boards with anti-bot terms, or purchased email lists.
 
 ## License
 

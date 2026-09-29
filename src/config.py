@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     scrape_timeout_seconds: float = 12.0
     scrape_max_bytes: int = 400_000
+    # Only for local development against sites on your own network. Keep False in
+    # any deployment: it disables the SSRF guard on the inbound-lead webhook.
+    scrape_allow_private_hosts: bool = False
     user_agent: str = (
         "LeadQualificationAgent/1.0 (+https://github.com/lupenox/lead-qualification-agent)"
     )
