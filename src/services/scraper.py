@@ -8,6 +8,11 @@ from bs4 import BeautifulSoup
 
 from config import Settings, get_settings
 from schemas import CompanyProfile, InboundLead
+from services.robots import robots_allows
+from services.url_guard import Resolver, UnsafeURLError, validate_public_url
+
+MAX_REDIRECTS = 5
+ROBOTS_MAX_BYTES = 64_000
 
 BUYING_SIGNAL_PATTERNS = {
     "pricing_page": re.compile(r"\b(pricing|plans|request a demo|book a demo)\b", re.I),
@@ -34,23 +39,55 @@ def _origin(url: str) -> str:
 
 
 def _robots_allows(robots_txt: str, user_agent: str, path: str) -> bool:
-    """Minimal robots.txt check. Defaults to allow when the file is missing or unreadable."""
-    if not robots_txt.strip():
-        return True
-    applicable = False
-    for raw in robots_txt.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.lower().startswith("user-agent:"):
-            agent = line.split(":", 1)[1].strip()
-            applicable = agent == "*" or agent.lower() in user_agent.lower()
-            continue
-        if applicable and line.lower().startswith("disallow:"):
-            rule = line.split(":", 1)[1].strip() or "/"
-            if path.startswith(rule):
-                return False
-    return True
+    """RFC 9309 robots.txt check. Defaults to allow when the file is missing or empty."""
+    return robots_allows(robots_txt, user_agent, path)
+
+
+class FetchError(Exception):
+    """Raised when a guarded fetch cannot complete."""
+
+
+async def guarded_get(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    max_bytes: int,
+    max_redirects: int = MAX_REDIRECTS,
+    resolver: Resolver | None = None,
+    allow_private: bool = False,
+) -> tuple[int, str, str]:
+    """GET ``url`` validating every hop against the SSRF guard.
+
+    Redirects are followed manually so each ``Location`` is re-validated before it
+    is requested. The body is streamed and truncated at ``max_bytes``.
+    Returns ``(status_code, final_url, text)``.
+    """
+    current = url
+    for _ in range(max_redirects + 1):
+        await validate_public_url(current, resolver=resolver, allow_private=allow_private)
+        request = client.build_request("GET", current, headers=headers)
+        response = await client.send(request, stream=True, follow_redirects=False)
+        try:
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise FetchError(f"redirect from {current} without Location header")
+                current = urljoin(current, location)
+                continue
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= max_bytes:
+                    break
+            body = b"".join(chunks)[:max_bytes]
+            encoding = response.encoding or "utf-8"
+            return response.status_code, current, body.decode(encoding, errors="replace")
+        finally:
+            await response.aclose()
+    raise FetchError(f"too many redirects (>{max_redirects})")
 
 
 def extract_profile(html: str, lead: InboundLead) -> CompanyProfile:
@@ -96,19 +133,31 @@ async def scrape_homepage(
     lead: InboundLead,
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
+    resolver: Resolver | None = None,
 ) -> CompanyProfile:
     settings = settings or get_settings()
     url = str(lead.website)
     headers = {"User-Agent": settings.user_agent, "Accept": "text/html,application/xhtml+xml"}
+    fetch_kwargs = {
+        "headers": headers,
+        "resolver": resolver,
+        "allow_private": settings.scrape_allow_private_hosts,
+    }
     owns_client = client is None
-    client = client or httpx.AsyncClient(follow_redirects=True, timeout=settings.scrape_timeout_seconds)
+    client = client or httpx.AsyncClient(follow_redirects=False, timeout=settings.scrape_timeout_seconds)
     try:
         robots_url = urljoin(_origin(url), "/robots.txt")
-        robots_resp = await client.get(robots_url, headers=headers)
-        path = urlparse(url).path or "/"
-        if robots_resp.status_code == 200 and not _robots_allows(
-            robots_resp.text, settings.user_agent, path
-        ):
+        try:
+            robots_status, _, robots_text = await guarded_get(
+                client, robots_url, max_bytes=ROBOTS_MAX_BYTES, **fetch_kwargs
+            )
+        except UnsafeURLError:
+            raise
+        except Exception:  # noqa: BLE001 - unreachable robots.txt means "no rules"
+            robots_status, robots_text = 0, ""
+        parsed = urlparse(url)
+        path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+        if robots_status == 200 and not _robots_allows(robots_text, settings.user_agent, path):
             return CompanyProfile(
                 company_name=lead.company_name,
                 website=url,
@@ -116,9 +165,11 @@ async def scrape_homepage(
                 scrape_error="robots.txt disallows this path",
             )
 
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        html = response.text[: settings.scrape_max_bytes]
+        status, final_url, html = await guarded_get(
+            client, url, max_bytes=settings.scrape_max_bytes, **fetch_kwargs
+        )
+        if status >= 400:
+            raise FetchError(f"HTTP {status} for {final_url}")
         return extract_profile(html, lead)
     except Exception as exc:  # noqa: BLE001 - persist a usable profile on any fetch failure
         return CompanyProfile(
